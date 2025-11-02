@@ -1,0 +1,158 @@
+﻿from __future__ import annotations
+
+import json as _json
+from logger import crawler_thread_logger as logger
+from typing import Dict, Callable
+import traceback as _tb
+import os as _os
+
+from DrissionPage._pages.chromium_tab import ChromiumTab
+
+from gmaps_crawler.pipeline.utils import _dismiss_consent
+
+# use named crawler logger
+
+
+def make_extract_worker(*, 
+                        browser, 
+                        tab_pool, 
+                        run_ctx, 
+                        tile_ctx, 
+                        query) -> Callable[[Dict], Dict]:
+    def _worker(info: Dict) -> Dict:
+        if run_ctx is None or tile_ctx is None:
+            raise RuntimeError("context missing")
+        tab: ChromiumTab = tab_pool.acquire()
+        try:
+            href = (info.get("href") or "").strip()
+            name = (info.get("name") or "").strip()
+            pid = str(info.get("_pid") or "")
+            if not href:
+                return {"status": "failed", "payload": {"place_id": pid, "last_error": "empty href"}}
+            try:
+                _dismiss_consent(tab)
+            except Exception as e:
+                logger.error("dismiss consent failed on detail tab: %s", e)
+                return {
+                    "status": "failed",
+                    "payload": {
+                        "place_id": pid,
+                        "city": run_ctx.city,
+                        "query": query,
+                        "tile_index": tile_ctx.index,
+                        "name": name,
+                        "href": href,
+                        "lat": float(info.get("_lat") or 0.0),
+                        "lng": float(info.get("_lng") or 0.0),
+                        "last_error": "consent dismiss failed",
+                        "warnings": "[]",
+                        "extracted_at": None,
+                        "run_id": run_ctx.run_id,
+                    },
+                }
+            tab.get(href)
+            try:
+                tab.wait.ele_displayed('xpath://h1[text() != ""]', timeout=8)
+            except Exception as e:
+                logger.error("title wait failed: %s", e)
+                return {
+                    "status": "failed",
+                    "payload": {
+                        "place_id": pid,
+                        "city": run_ctx.city,
+                        "query": query,
+                        "tile_index": tile_ctx.index,
+                        "name": name,
+                        "href": href,
+                        "lat": float(info.get("_lat") or 0.0),
+                        "lng": float(info.get("_lng") or 0.0),
+                        "last_error": "title wait failed",
+                        "warnings": "[]",
+                        "extracted_at": None,
+                        "run_id": run_ctx.run_id,
+                    },
+                }
+            from gmaps_crawler.pipeline.extractors import extract_pipeline
+            data = extract_pipeline(tab, browser, city_name=run_ctx.city, place_id=info.get("_pid"))
+            address = (data.get("address") or "").strip()
+            warnings_json = _json.dumps(data.get("warnings") or [], ensure_ascii=False)
+            if not address:
+                logger.warning("[extract][failed] tile=%d pid=%s reason=%s", tile_ctx.index, pid, "missing address")
+                return {
+                    "status": "failed",
+                    "payload": {
+                        "place_id": pid,
+                        "city": run_ctx.city,
+                        "query": query,
+                        "tile_index": tile_ctx.index,
+                        "name": name,
+                        "href": href,
+                        "lat": float(info.get("_lat")),
+                        "lng": float(info.get("_lng")),
+                        "last_error": "missing address",
+                        "warnings": warnings_json,
+                        "extracted_at": None,
+                        "run_id": run_ctx.run_id,
+                    },
+                }
+            payload = {
+                "place_id": info["_pid"],
+                "city": run_ctx.city,
+                "query": query,
+                "tile_index": tile_ctx.index,
+                "name": name,
+                "href": href,
+                "lat": float(info["_lat"]),
+                "lng": float(info["_lng"]),
+                "address": address,
+                "location": str(data.get("location") or ""),
+                "phone": str(data.get("phone") or ""),
+                "plus_code": str(data.get("plus_code") or ""),
+                "website": str(data.get("website") or ""),
+                "social_media_urls": _json.dumps(data.get("social_media_urls") or [], ensure_ascii=False),
+                "open_time": str(data.get("open_time") or ""),
+                "emails_phones_socials": _json.dumps(data.get("emails_phones_socials") or {}, ensure_ascii=False),
+                "warnings": warnings_json,
+            }
+            return {"status": "success", "payload": payload}
+        except Exception as e:
+            # Include exception message and last frame origin (file:line) in a single line
+            _origin = "?:?"
+            tb = e.__traceback__
+            while tb and tb.tb_next:
+                tb = tb.tb_next
+            if tb is not None:
+                try:
+                    _origin = f"{_os.path.basename(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}"
+                except Exception:
+                    _origin = "?:?"
+            logger.warning(
+                "[extract][failed] tile=%d pid=%s reason=%s msg=%s at=%s",
+                tile_ctx.index,
+                str(info.get("_pid") or ""),
+                getattr(e, "__class__", type(e)).__name__,
+                str(e),
+                _origin,
+            )
+            return {
+                "status": "failed",
+                "payload": {
+                    "place_id": str(info.get("_pid") or ""),
+                    "city": run_ctx.city,
+                    "query": query,
+                    "tile_index": tile_ctx.index,
+                    "name": name if "name" in locals() else str(info.get("name") or ""),
+                    "href": href if "href" in locals() else str(info.get("href") or ""),
+                    "lat": float(info.get("_lat") or 0.0),
+                    "lng": float(info.get("_lng") or 0.0),
+                    "last_error": getattr(e, "__class__", type(e)).__name__,
+                    "warnings": "[]",
+                    "extracted_at": None,
+                    "run_id": run_ctx.run_id,
+                },
+            }
+        finally:
+            tab_pool.release(tab)
+
+    return _worker
+
